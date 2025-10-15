@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Classroom Attendance</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // --- FIREBASE IMPORTS AND SETUP (MANDATORY ENVIRONMENT SETUP) ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof _firebase_config !== 'undefined' ? JSON.parse(_firebase_config) : {};
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let auth;
+        let isAuthReady = false;
+        // Tracks the current visual source: 'camera' or 'upload'
+        let currentSource = 'camera'; 
+
+        async function initFirebase() {
+            try {
+                if (Object.keys(firebaseConfig).length > 0) {
+                    const app = initializeApp(firebaseConfig);
+                    auth = getAuth(app);
+                    
+                    if (initialAuthToken) {
+                        await signInWithCustomToken(auth, initialAuthToken);
+                    } else {
+                        await signInAnonymously(auth);
+                    }
+                }
+                isAuthReady = true;
+                console.log("Firebase initialized and authenticated.");
+                // Start camera after auth is ready
+                initCamera(); 
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                document.getElementById('status-message').textContent = 'Error: Firebase failed to initialize.';
+            }
+        }
+        
+        // --- GLOBAL VARIABLES AND UTILITIES ---
+        const apiKey = ""; // Canvas environment provides API Key at runtime
+        const API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-05-20:generateContent";
+        let videoStream;
+        
+        // --- EFFICIENCY IMPROVEMENT: Max dimension for resized image to reduce payload size ---
+        const MAX_IMAGE_DIMENSION = 800; 
+
+        // Converts the canvas image data to a Base64 PNG string
+        function canvasToBase64(canvas) {
+            // Using JPEG at 0.8 quality for better compression/speed for API calls
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.8); 
+            // Extracts the base64 part: "data:image/jpeg;base64,..." -> "..."
+            return dataUrl.split(',')[1]; 
+        }
+
+        /**
+         * Efficiently resizes the source (video or image) onto the hidden canvas 
+         * before conversion to Base64, reducing API payload size.
+         */
+        function resizeAndDraw(source, canvas) {
+            let width, height;
+            
+            // Get initial dimensions from the source element
+            if (currentSource === 'upload') {
+                width = source.naturalWidth || source.width;
+                height = source.naturalHeight || source.height;
+            } else {
+                width = source.videoWidth;
+                height = source.videoHeight;
+            }
+
+            // Calculate new dimensions while maintaining aspect ratio and respecting MAX_IMAGE_DIMENSION
+            let ratio = 1;
+            if (width > height && width > MAX_IMAGE_DIMENSION) {
+                ratio = MAX_IMAGE_DIMENSION / width;
+            } else if (height > width && height > MAX_IMAGE_DIMENSION) {
+                ratio = MAX_IMAGE_DIMENSION / height;
+            }
+
+            const newWidth = Math.floor(width * ratio);
+            const newHeight = Math.floor(height * ratio);
+
+            // Set canvas to new (smaller) dimensions
+            canvas.width = newWidth;
+            canvas.height = newHeight;
+            
+            // Draw the image onto the resized canvas
+            const context = canvas.getContext('2d');
+            context.imageSmoothingEnabled = true; // For smooth scaling
+            context.drawImage(source, 0, 0, newWidth, newHeight);
+        }
+
+        // Exponential Backoff Retry Function
+        async function fetchWithRetry(url, options, maxRetries = 5) {
+            for (let i = 0; i < maxRetries; i++) {
+                try {
+                    const response = await fetch(url, options);
+                    if (response.status === 429 && i < maxRetries - 1) {
+                        const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                        console.warn(Rate limit hit. Retrying in ${Math.round(delay)}ms...);
+                        await new Promise(resolve => setTimeout(resolve, delay));
+                        continue;
+                    }
+                    if (!response.ok) {
+                        const errorBody = await response.text();
+                        throw new Error(API Request failed with status ${response.status}: ${errorBody});
+                    }
+                    return response;
+                } catch (error) {
+                    if (i === maxRetries - 1) throw error;
+                    const delay = Math.pow(2, i) * 1000 + Math.random() * 1000;
+                    console.error(Fetch error (Attempt ${i + 1}/${maxRetries}): ${error.message}. Retrying in ${Math.round(delay)}ms...);
+                    await new Promise(resolve => setTimeout(resolve, delay));
+                }
+            }
+        }
+
+
+        // --- CAMERA AND CAPTURE LOGIC (Unchanged) ---
+
+        function initCamera() {
+            const video = document.getElementById('videoFeed');
+            const statusMessage = document.getElementById('status-message');
+            
+            if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+                navigator.mediaDevices.getUserMedia({ 
+                    video: { 
+                        facingMode: 'environment' // Prefer back camera for class photos
+                    } 
+                })
+                .then(stream => {
+                    videoStream = stream;
+                    video.srcObject = stream;
+                    video.classList.remove('hidden');
+                    document.getElementById('imagePreview').classList.add('hidden');
+                    video.play();
+                    statusMessage.textContent = 'Camera ready. Point at the class and take attendance.';
+                    document.getElementById('attendanceButton').disabled = false;
+                    currentSource = 'camera';
+                })
+                .catch(err => {
+                    console.error("Error accessing the camera:", err);
+                    statusMessage.textContent = 'Error: Could not access the camera. Switching to upload mode.';
+                    document.getElementById('attendanceButton').disabled = true;
+                    // If camera fails, switch to upload mode UI
+                    switchToUploadMode();
+                });
+            } else {
+                statusMessage.textContent = 'Error: Your browser does not support media devices. Switching to upload mode.';
+                document.getElementById('attendanceButton').disabled = true;
+                switchToUploadMode();
+            }
+        }
+        
+        function switchToUploadMode() {
+            document.getElementById('videoFeed').classList.add('hidden');
+            document.getElementById('imagePreview').classList.remove('hidden');
+            document.getElementById('imagePreview').src = 'https://placehold.co/800x600/FEE2E2/EF4444?text=Upload+Image+To+Begin';
+            currentSource = 'upload';
+        }
+
+        function handleImageUpload(event) {
+            const video = document.getElementById('videoFeed');
+            const imagePreview = document.getElementById('imagePreview');
+            const statusMessage = document.getElementById('status-message');
+            const file = event.target.files[0];
+            
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    imagePreview.src = e.target.result;
+                    imagePreview.classList.remove('hidden');
+                    video.classList.add('hidden');
+                    
+                    if (videoStream) {
+                        videoStream.getTracks().forEach(track => track.stop()); // Stop camera feed
+                    }
+
+                    document.getElementById('attendanceButton').disabled = false;
+                    document.getElementById('resultDisplay').innerHTML = '';
+                    statusMessage.textContent = 'Image uploaded. Ready to count attendance.';
+                    currentSource = 'upload';
+                };
+                reader.readAsDataURL(file);
+            }
+        }
+
+
+        // --- GEMINI API CALL FOR IMAGE ANALYSIS (Unchanged) ---
+
+        async function callGeminiAPI(base64ImageData) {
+            const statusMessage = document.getElementById('status-message');
+            const attendanceButton = document.getElementById('attendanceButton');
+            const resultDisplay = document.getElementById('resultDisplay');
+            
+            attendanceButton.disabled = true;
+            resultDisplay.innerHTML = '';
+            statusMessage.textContent = 'Analyzing photo with AI... Please wait.';
+
+            // System prompt remains the same
+            const systemPrompt = "You are an accurate vision model specializing in counting human figures (students) in classroom images. Your primary task is to find the total count and a very brief summary. The final output must be JSON.";
+            
+            // User query remains the same
+            const userQuery = "Analyze this classroom image. First, state the total number of distinct human figures or faces visible. Second, provide a concise, single-sentence summary of the classroom scene. Provide your response as a JSON object matching the provided schema.";
+
+            const payload = {
+                contents: [{ 
+                    parts: [
+                        { text: userQuery },
+                        {
+                            inlineData: {
+                                mimeType: "image/jpeg",
+                                data: base64ImageData
+                            }
+                        }
+                    ] 
+                }],
+                systemInstruction: {
+                    parts: [{ text: systemPrompt }]
+                },
+                generationConfig: {
+                    responseMimeType: "application/json",
+                    responseSchema: {
+                        type: "OBJECT",
+                        properties: {
+                            "studentCount": { 
+                                "type": "NUMBER",
+                                "description": "The final count of human figures/students detected." 
+                            },
+                            "sceneSummary": { 
+                                "type": "STRING",
+                                "description": "A single, brief sentence describing the classroom scene." 
+                            }
+                        },
+                        "propertyOrdering": ["studentCount", "sceneSummary"]
+                    }
+                }
+            };
+
+            try {
+                const response = await fetchWithRetry(${API_URL}?key=${apiKey}, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+
+                const result = await response.json();
+                
+                const candidate = result.candidates?.[0];
+                if (candidate && candidate.content?.parts?.[0]?.text) {
+                    const jsonText = candidate.content.parts[0].text;
+                    const parsedJson = JSON.parse(jsonText);
+                    
+                    const count = parsedJson.studentCount || 0;
+                    const summary = parsedJson.sceneSummary || "Analysis complete.";
+                    
+                    document.getElementById('resultDisplay').innerHTML = `
+                        <div class="bg-green-100 border-l-4 border-green-500 text-green-700 p-4 rounded-lg shadow-md mt-4">
+                            <p class="font-bold text-lg">Attendance Marked Successfully!</p>
+                            <p class="text-3xl font-extrabold my-2">${count} Students Counted</p>
+                            <p class="text-sm italic">${summary}</p>
+                            <p class="text-xs mt-2">Note: This is an AI-generated count. Manual verification recommended.</p>
+                        </div>
+                    `;
+                    statusMessage.textContent = 'Attendance counted using AI.';
+
+                } else {
+                    statusMessage.textContent = 'AI analysis failed: Could not parse response.';
+                    document.getElementById('resultDisplay').innerHTML = `
+                        <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 rounded-lg shadow-md mt-4">
+                            <p class="font-bold text-lg">Analysis Error</p>
+                            <p>The AI could not return a valid count. Please try taking a clearer photo.</p>
+                        </div>
+                    `;
+                    console.error("API response was malformed:", result);
+                }
+
+            } catch (error) {
+                statusMessage.textContent = Error during AI processing: ${error.message};
+                console.error("API Call Error:", error);
+                document.getElementById('resultDisplay').innerHTML = `
+                    <div class="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 rounded-lg shadow-md mt-4">
+                        <p class="font-bold text-lg">Connection Error</p>
+                        <p>Could not connect to the AI service. Please check your network.</p>
+                    </div>
+                `;
+            } finally {
+                attendanceButton.disabled = false;
+            }
+        }
+
+        // --- MAIN APPLICATION FUNCTION (Updated for efficiency) ---
+
+        function takeAttendance() {
+            const canvas = document.getElementById('photoCanvas');
+            const statusMessage = document.getElementById('status-message');
+            let sourceElement;
+            
+            // Determine the source element and validate
+            if (currentSource === 'upload') {
+                sourceElement = document.getElementById('imagePreview');
+                if (!sourceElement.src || sourceElement.src.includes('placehold.co')) {
+                    statusMessage.textContent = 'Please upload a photo first.';
+                    return;
+                }
+            } else {
+                sourceElement = document.getElementById('videoFeed');
+                if (!sourceElement.srcObject && sourceElement.videoWidth === 0) {
+                    statusMessage.textContent = 'Camera is not active. Please switch modes or allow access.';
+                    return;
+                }
+            }
+
+            // Efficiency Step: Draw and resize the source element onto the canvas
+            resizeAndDraw(sourceElement, canvas);
+            
+            // Get Base64 image data from the resized canvas
+            const base64Data = canvasToBase64(canvas);
+            
+            // Call the AI
+            callGeminiAPI(base64Data);
+        }
+
+        // Expose functions to the global scope for buttons to call
+        window.takeAttendance = takeAttendance;
+        window.initCamera = initCamera; // Expose to allow switching back to camera
+
+        // Initialize Firebase and set up file upload listener
+        window.onload = function() {
+            document.getElementById('imageUpload').addEventListener('change', handleImageUpload);
+            initFirebase();
+        };
+        
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body { font-family: 'Inter', sans-serif; }
+        /* Style the common visual display area */
+        .visual-source {
+            width: 100%;
+            height: auto;
+            max-height: 70vh;
+            border-radius: 12px;
+            object-fit: contain; 
+            box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1), 0 4px 6px -2px rgba(0, 0, 0, 0.05);
+            background: #2d3748; 
+            margin-bottom: 1.5rem;
+        }
+        /* Hide the canvas, it's only used for processing */
+        #photoCanvas {
+            display: none;
+        }
+    </style>
+</head>
+<body class="bg-gray-50 min-h-screen p-4 sm:p-8">
+
+    <div class="max-w-4xl mx-auto">
+        <h1 class="text-3xl font-extrabold text-gray-900 mb-2">AI-Powered Attendance</h1>
+        <p class="text-gray-600 mb-6">Capture or upload a class photo. The AI will count the number of students.</p>
+
+        <!-- Video Feed / Image Preview Container -->
+        <div class="w-full relative bg-gray-700 rounded-xl overflow-hidden">
+            <video id="videoFeed" class="visual-source hidden" autoplay playsinline></video>
+            <img id="imagePreview" class="visual-source hidden" alt="Uploaded Image Preview">
+            <canvas id="photoCanvas"></canvas>
+            <div id="status-message" class="absolute bottom-0 left-0 right-0 bg-black bg-opacity-50 text-white p-3 text-center text-sm font-medium">Initializing...</div>
+        </div>
+        
+        <div class="flex space-x-4 mt-6">
+            <!-- Upload Photo Button -->
+            <button onclick="document.getElementById('imageUpload').click()"
+                    class="flex-1 bg-gray-200 hover:bg-gray-300 text-gray-800 font-bold py-3 px-4 rounded-xl shadow-md transition duration-200">
+                <svg class="inline w-5 h-5 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-1-4h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                Upload Photo
+            </button>
+            <input type="file" id="imageUpload" accept="image/*" class="hidden">
+            
+            <!-- Main Attendance Button -->
+            <button id="attendanceButton" onclick="takeAttendance()" disabled 
+                    class="flex-1 bg-indigo-600 hover:bg-indigo-700 text-white font-bold py-3 px-6 rounded-xl shadow-lg transition duration-200 disabled:opacity-50 disabled:cursor-not-allowed transform hover:scale-[1.01] active:scale-[0.99] focus:outline-none focus:ring-4 focus:ring-indigo-300">
+                <svg class="inline w-6 h-6 mr-1 -mt-1" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.218A2 2 0 0110.74 4h2.52a2 2 0 011.664.89l.812 1.218a2 2 0 001.664.89H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                Count Attendance
+            </button>
+        </div>
+
+        <!-- Results Display -->
+        <div id="resultDisplay" class="mt-8">
+            <!-- Results will appear here -->
+        </div>
+    </div>
+
+</body>
+</html>
